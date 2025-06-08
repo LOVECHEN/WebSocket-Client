@@ -1,0 +1,280 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+# 添加必要的权限
+permissions:
+  contents: write      # 创建 release 和 tag 需要
+  actions: read        # 读取 actions
+  checks: write        # 写入检查状态
+  pull-requests: write # PR 相关权限
+
+env:
+  GO_VERSION: '1.24.4'
+  BINARY_NAME: 'wsc'
+
+jobs:
+  # 构建所有平台
+  build:
+    name: Build All Platforms
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+
+    - name: Cache Go modules
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+
+    - name: Install dependencies
+      run: go mod download
+
+    - name: Generate version
+      id: version
+      run: |
+        VERSION="v$(date '+%Y.%m.%d')-$(git rev-parse --short HEAD)"
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Generated version: $VERSION"
+
+    - name: Install UPX
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y upx-ucl zip
+
+    - name: Build all platforms
+      run: |
+        mkdir -p build
+
+        # 生成构建信息
+        BUILD_TIME=$(date '+%Y-%m-%d_%H:%M:%S_%Z')
+        GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+        GO_VERSION=$(go version | cut -d' ' -f3)
+        VERSION="${{ steps.version.outputs.version }}"
+        LDFLAGS="-s -w -X main.AppVersion=${VERSION} -X main.BuildTime=${BUILD_TIME} -X main.GitCommit=${GIT_COMMIT} -X main.GoVersion=${GO_VERSION}"
+
+        # 构建所有平台
+        platforms=(
+          "linux/amd64"
+          "linux/arm64"
+          "darwin/amd64"
+          "darwin/arm64"
+          "windows/amd64"
+          "windows/arm64"
+        )
+
+        for platform in "${platforms[@]}"; do
+          IFS='/' read -r os arch <<< "$platform"
+          ext=""
+          if [ "$os" = "windows" ]; then
+            ext=".exe"
+          fi
+
+          binary_name="${{ env.BINARY_NAME }}_${os}_${arch}${ext}"
+          echo "🔨 构建 $binary_name..."
+
+          CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build \
+            -ldflags="${LDFLAGS}" \
+            -o "build/$binary_name" main.go
+
+          if [ -f "build/$binary_name" ]; then
+            echo "✅ 构建成功: $binary_name"
+          else
+            echo "❌ 构建失败: $binary_name"
+            exit 1
+          fi
+        done
+
+    - name: Compress binaries with UPX
+      run: |
+        cd build
+        echo "🗜️ 开始 UPX 压缩..."
+
+        for binary in ${{ env.BINARY_NAME }}_*; do
+          if [ -f "$binary" ]; then
+            echo "尝试压缩 $binary..."
+            original_size=$(stat -c%s "$binary" 2>/dev/null || stat -f%z "$binary")
+
+            # 尝试 UPX 压缩，失败时继续
+            if upx --best "$binary" 2>/dev/null; then
+              compressed_size=$(stat -c%s "$binary" 2>/dev/null || stat -f%z "$binary")
+              ratio=$(echo "scale=1; (1 - $compressed_size/$original_size) * 100" | bc -l 2>/dev/null || echo "unknown")
+              echo "✅ 压缩成功 $binary (减少 ${ratio}%)"
+            else
+              echo "⚠️ 压缩失败 $binary，继续使用原始文件"
+            fi
+          fi
+        done
+
+    - name: Create ZIP packages
+      run: |
+        cd build
+        echo "📦 创建 ZIP 包..."
+
+        for binary in ${{ env.BINARY_NAME }}_*; do
+          if [ -f "$binary" ]; then
+            zip_name="${binary}.zip"
+            echo "创建 $zip_name..."
+            zip "$zip_name" "$binary"
+
+            if [ -f "$zip_name" ]; then
+              echo "✅ 创建成功: $zip_name"
+            else
+              echo "❌ 创建失败: $zip_name"
+            fi
+          fi
+        done
+
+    - name: Generate checksums
+      run: |
+        cd build
+        echo "🔐 生成校验和..."
+        sha256sum *.zip > SHA256SUMS 2>/dev/null || shasum -a 256 *.zip > SHA256SUMS
+        echo "📋 校验和文件内容："
+        cat SHA256SUMS
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: release-packages
+        path: |
+          build/*.zip
+          build/SHA256SUMS
+
+  # 自动发布（仅在 push 到 main 分支时）
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: release-packages
+        path: build/
+
+    - name: List artifacts
+      run: |
+        echo "📦 下载的构建产物："
+        ls -la build/
+
+    - name: Prepare release
+      run: |
+        VERSION="${{ needs.build.outputs.version }}"
+        echo "准备发布版本: $VERSION"
+        echo "构建产物："
+        ls -la build/
+
+    - name: Create Release with GitHub CLI
+      run: |
+        VERSION="${{ needs.build.outputs.version }}"
+        BUILD_TIME=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+        # 创建 release notes
+        cat > release_notes.md << 'EOF'
+        ## WebSocket Client ${{ needs.build.outputs.version }}
+
+        ### 🚀 企业级高性能WebSocket客户端
+
+        **自动构建版本** - 构建时间: BUILD_TIME_PLACEHOLDER
+
+        #### 📦 下载
+        选择适合您系统的二进制文件：
+
+        | 平台 | 架构 | 下载链接 |
+        |------|------|----------|
+        | Linux | AMD64 | [wsc_linux_amd64.zip](./wsc_linux_amd64.zip) |
+        | Linux | ARM64 | [wsc_linux_arm64.zip](./wsc_linux_arm64.zip) |
+        | macOS | AMD64 | [wsc_darwin_amd64.zip](./wsc_darwin_amd64.zip) |
+        | macOS | ARM64 | [wsc_darwin_arm64.zip](./wsc_darwin_arm64.zip) |
+        | Windows | AMD64 | [wsc_windows_amd64.exe.zip](./wsc_windows_amd64.exe.zip) |
+        | Windows | ARM64 | [wsc_windows_arm64.exe.zip](./wsc_windows_arm64.exe.zip) |
+
+        #### 🔐 校验文件完整性
+        ```bash
+        # 下载校验和文件
+        curl -LO https://github.com/${{ github.repository }}/releases/download/${{ needs.build.outputs.version }}/SHA256SUMS
+
+        # 验证文件完整性
+        sha256sum -c SHA256SUMS
+        ```
+
+        #### 🚀 快速开始
+        ```bash
+        # 下载并解压 (Linux 示例)
+        curl -LO https://github.com/${{ github.repository }}/releases/download/${{ needs.build.outputs.version }}/wsc_linux_amd64.zip
+        unzip wsc_linux_amd64.zip
+        chmod +x wsc_linux_amd64
+        ./wsc_linux_amd64 --version
+
+        # 连接WebSocket服务器
+        ./wsc_linux_amd64 wss://echo.websocket.org
+        ```
+
+        #### 📋 版本信息
+        - **版本**: ${{ needs.build.outputs.version }}
+        - **提交**: ${{ github.sha }}
+        - **Go版本**: ${{ env.GO_VERSION }}
+        - **构建优化**: ✅ 已启用
+        - **多平台支持**: ✅ 6个平台
+        EOF
+
+        # 替换时间占位符
+        sed -i "s/BUILD_TIME_PLACEHOLDER/$BUILD_TIME/g" release_notes.md
+
+        # 使用 GitHub CLI 创建 release
+        gh release create "$VERSION" \
+          --title "WebSocket Client $VERSION" \
+          --notes-file release_notes.md \
+          --latest \
+          build/*.zip \
+          build/SHA256SUMS
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # 通知
+  notify:
+    name: Notify
+    runs-on: ubuntu-latest
+    needs: [build, release]
+    if: always()
+    steps:
+    - name: Notify success
+      if: ${{ needs.build.result == 'success' }}
+      run: |
+        echo "✅ 构建完成！"
+        if [ "${{ needs.release.result }}" = "success" ]; then
+          echo "🎉 发布成功！"
+        elif [ "${{ needs.release.result }}" = "skipped" ]; then
+          echo "ℹ️ 发布已跳过（非 main 分支）"
+        fi
+
+    - name: Notify failure
+      if: ${{ needs.build.result == 'failure' || needs.release.result == 'failure' }}
+      run: |
+        if [ "${{ needs.build.result }}" = "failure" ]; then
+          echo "❌ 构建失败！请检查日志。"
+        fi
+        if [ "${{ needs.release.result }}" = "failure" ]; then
+          echo "❌ 发布失败！请检查日志。"
+        fi

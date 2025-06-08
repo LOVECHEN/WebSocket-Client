@@ -1,0 +1,234 @@
+name: Security Scan
+
+on:
+  schedule:
+    # 每周一凌晨2点运行
+    - cron: '0 2 * * 1'
+  workflow_dispatch:
+    # 允许手动触发
+
+jobs:
+  security-scan:
+    name: Weekly Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.24.4'
+
+    - name: Cache Go modules
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+
+    - name: Auto update dependencies
+      run: |
+        echo "🔄 自动更新依赖..."
+        go mod tidy
+        go get -u all
+        go mod verify
+        
+        # 检查是否有更新
+        if [ -n "$(git diff go.mod go.sum)" ]; then
+          echo "📋 发现依赖更新："
+          git diff go.mod go.sum
+          echo "HAS_UPDATES=true" >> $GITHUB_ENV
+        else
+          echo "✅ 依赖已是最新版本"
+          echo "HAS_UPDATES=false" >> $GITHUB_ENV
+        fi
+
+    - name: Install security tools
+      run: |
+        echo "🔧 安装安全扫描工具..."
+        go install golang.org/x/vuln/cmd/govulncheck@latest
+        go install github.com/securecodewarrior/gosec/v2/cmd/gosec@latest
+
+    - name: Run vulnerability scan
+      id: vuln_scan
+      run: |
+        echo "🔍 运行漏洞扫描..."
+        
+        # 运行govulncheck
+        echo "## Govulncheck Results" > security_report.md
+        if govulncheck ./... > govulncheck.txt 2>&1; then
+          echo "✅ Govulncheck: 未发现已知漏洞" >> security_report.md
+          echo "VULN_STATUS=clean" >> $GITHUB_ENV
+        else
+          echo "❌ Govulncheck: 发现潜在漏洞" >> security_report.md
+          echo '```' >> security_report.md
+          cat govulncheck.txt >> security_report.md
+          echo '```' >> security_report.md
+          echo "VULN_STATUS=found" >> $GITHUB_ENV
+        fi
+
+    - name: Run security analysis
+      id: sec_scan
+      run: |
+        echo "🔒 运行安全分析..."
+        
+        # 运行gosec
+        echo "" >> security_report.md
+        echo "## Gosec Results" >> security_report.md
+        if gosec -fmt json -out gosec.json ./... 2>/dev/null; then
+          # 解析gosec结果
+          issues=$(jq '.Issues | length' gosec.json 2>/dev/null || echo "0")
+          if [ "$issues" -eq 0 ]; then
+            echo "✅ Gosec: 未发现安全问题" >> security_report.md
+            echo "SEC_STATUS=clean" >> $GITHUB_ENV
+          else
+            echo "❌ Gosec: 发现 $issues 个安全问题" >> security_report.md
+            echo '```json' >> security_report.md
+            jq '.Issues' gosec.json >> security_report.md
+            echo '```' >> security_report.md
+            echo "SEC_STATUS=issues" >> $GITHUB_ENV
+          fi
+        else
+          echo "⚠️ Gosec: 扫描失败" >> security_report.md
+          echo "SEC_STATUS=error" >> $GITHUB_ENV
+        fi
+
+    - name: Check for high-risk vulnerabilities
+      id: risk_assessment
+      run: |
+        echo "⚖️ 评估风险等级..."
+        
+        # 检查是否有高危漏洞
+        high_risk=false
+        
+        if [ "$VULN_STATUS" = "found" ]; then
+          # 检查govulncheck输出中的高危关键词
+          if grep -i "critical\|high\|severe" govulncheck.txt; then
+            high_risk=true
+          fi
+        fi
+        
+        if [ "$SEC_STATUS" = "issues" ]; then
+          # 检查gosec输出中的高危问题
+          if jq -e '.Issues[] | select(.severity == "HIGH" or .confidence == "HIGH")' gosec.json >/dev/null 2>&1; then
+            high_risk=true
+          fi
+        fi
+        
+        if [ "$high_risk" = true ]; then
+          echo "🚨 发现高危安全问题！" >> security_report.md
+          echo "RISK_LEVEL=high" >> $GITHUB_ENV
+        else
+          echo "✅ 未发现高危安全问题" >> security_report.md
+          echo "RISK_LEVEL=low" >> $GITHUB_ENV
+        fi
+
+    - name: Generate security summary
+      run: |
+        echo "📊 生成安全摘要..."
+        
+        # 添加摘要到报告
+        echo "" >> security_report.md
+        echo "## Security Summary" >> security_report.md
+        echo "- **扫描时间**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> security_report.md
+        echo "- **Go版本**: $(go version | cut -d' ' -f3)" >> security_report.md
+        echo "- **依赖更新**: $HAS_UPDATES" >> security_report.md
+        echo "- **漏洞状态**: $VULN_STATUS" >> security_report.md
+        echo "- **安全状态**: $SEC_STATUS" >> security_report.md
+        echo "- **风险等级**: $RISK_LEVEL" >> security_report.md
+        
+        # 显示完整报告
+        echo "📋 安全扫描报告："
+        cat security_report.md
+
+    - name: Create issue for high-risk vulnerabilities
+      if: env.RISK_LEVEL == 'high'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const report = fs.readFileSync('security_report.md', 'utf8');
+          
+          const issue = await github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: `🚨 高危安全漏洞检测 - ${new Date().toISOString().split('T')[0]}`,
+            body: `## 🚨 安全警报
+          
+          定期安全扫描发现高危安全问题，需要立即处理！
+          
+          ${report}
+          
+          ## 🔧 建议操作
+          
+          1. **立即审查**：检查上述安全问题的详细信息
+          2. **更新依赖**：运行 \`go get -u all\` 更新到最新版本
+          3. **修复代码**：根据gosec建议修复代码安全问题
+          4. **重新测试**：修复后重新运行安全扫描
+          5. **发布补丁**：如有必要，发布安全补丁版本
+          
+          ## 📞 联系信息
+          
+          如需帮助，请联系安全团队或项目维护者。
+          
+          ---
+          *此issue由自动安全扫描生成*`,
+            labels: ['security', 'high-priority', 'bug']
+          });
+          
+          console.log(`Created issue #${issue.data.number}`);
+
+    - name: Create PR for dependency updates
+      if: env.HAS_UPDATES == 'true' && env.RISK_LEVEL != 'high'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          // 创建新分支
+          const branchName = `security/auto-update-deps-${Date.now()}`;
+          
+          // 获取main分支的最新commit
+          const mainRef = await github.rest.git.getRef({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            ref: 'heads/main'
+          });
+          
+          // 创建新分支
+          await github.rest.git.createRef({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            ref: `refs/heads/${branchName}`,
+            sha: mainRef.data.object.sha
+          });
+          
+          console.log(`Created branch: ${branchName}`);
+          
+          // 注意：实际的文件更新需要在这里实现
+          // 这里只是创建了分支，实际的go.mod和go.sum更新需要额外的步骤
+
+    - name: Upload security artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: security-scan-results
+        path: |
+          security_report.md
+          govulncheck.txt
+          gosec.json
+        retention-days: 30
+
+    - name: Notify scan completion
+      run: |
+        echo "✅ 安全扫描完成"
+        echo "风险等级: $RISK_LEVEL"
+        if [ "$RISK_LEVEL" = "high" ]; then
+          echo "🚨 发现高危问题，已创建issue"
+        elif [ "$HAS_UPDATES" = "true" ]; then
+          echo "📦 发现依赖更新，建议手动审查"
+        else
+          echo "🎉 一切正常，无需操作"
+        fi

@@ -1,0 +1,65 @@
+# 构建产物
+/build/
+/dist/
+wsc
+wsc.exe
+*.exe
+
+# 日志文件
+websocket_log_*.log
+*.log
+
+# 临时文件
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE和编辑器文件
+.vscode/
+.idea/
+*.iml
+.cursorindexingignore
+.specstory/
+
+# 测试覆盖率文件
+coverage.out
+coverage.html
+
+# Go模块缓存
+vendor/
+
+# 环境变量文件
+.env
+.env.local
+
+build.sh
+reset-github-repo.sh
+
+# 🔒 安全：防止提交敏感信息
+# GitHub Personal Access Tokens 和其他敏感信息
+*token*
+*pat*
+*secret*
+*.key
+*.pem
+*.p12
+*.pfx
+upload_*.sh
+deploy_*.sh
+*_token.sh
+*_secret.sh
+config.json
+secrets.json
+credentials.json
+bak
